@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd agent for the cswap quota daemon (cswap-quotad).
+
+  Install:
+    1. Make sure cswap-quotad is on PATH (it ships with claude-swap):
+         uv tool install --force claude-swap        # or: pipx install claude-swap
+       Confirm:  which cswap-quotad
+    2. Copy this file to ~/Library/LaunchAgents/, editing the ProgramArguments
+       path below if `which cswap-quotad` differs from /Users/USERNAME/.local/bin.
+    3. Load it:
+         launchctl load -w ~/Library/LaunchAgents/com.claude-swap.quotad.plist
+    4. Configure (optional; hot-reloads, no restart needed):
+         edit ~/.claude-swap-backup/quota-daemon.json
+
+  Unload / stop:
+    launchctl unload -w ~/Library/LaunchAgents/com.claude-swap.quotad.plist
+
+  Logs: /tmp/cswap-quotad.log  (both stdout and stderr)
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.claude-swap.quotad</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/USERNAME/.local/bin/cswap-quotad</string>
+    </array>
+
+    <!-- Start at login and keep it alive; it is a long-running loop. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Throttle relaunches so a crash-loop can't hammer anything. -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/cswap-quotad.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/cswap-quotad.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

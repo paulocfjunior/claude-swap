@@ -8,6 +8,8 @@ import os
 import re
 import shutil
 import sys
+import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -74,8 +76,32 @@ KEYRING_SERVICE = "claude-code"
 # on profile endpoints. Matches Claude Code's CLAUDE_CODE_OAUTH_TOKEN path.
 SETUP_TOKEN_SCOPES = ("user:inference",)
 
-# Usage cache
-_USAGE_CACHE_TTL = 15  # seconds
+# Usage cache TTL (seconds). The companion quota daemon (``cswap-quotad``) keeps
+# ``<backup>/cache/usage.json`` continuously fresh with SERIAL, rate-limit-safe
+# polls, so a long default lets every ``cswap``/TUI/CombusDesktop read hit that
+# daemon-written cache instead of firing its own parallel burst (the HTTP-429
+# source). Override with ``CSWAP_USAGE_CACHE_TTL`` (e.g. lower it when running
+# cswap standalone without the daemon, where fresher-but-occasional fetches are
+# preferable). A value of ``0`` disables the cache (always fetch).
+_DEFAULT_USAGE_CACHE_TTL = 300  # seconds
+_USAGE_CACHE_TTL_ENV = "CSWAP_USAGE_CACHE_TTL"
+
+
+def _usage_cache_ttl() -> float:
+    """Resolve the usage-cache TTL, honoring ``CSWAP_USAGE_CACHE_TTL``.
+
+    Falls back to ``_DEFAULT_USAGE_CACHE_TTL`` when the env var is unset, empty,
+    non-numeric, or negative, so a bad value can never make the cache read stricter
+    than the default by accident.
+    """
+    raw = os.environ.get(_USAGE_CACHE_TTL_ENV)
+    if raw is None or not raw.strip():
+        return _DEFAULT_USAGE_CACHE_TTL
+    try:
+        val = float(raw)
+    except ValueError:
+        return _DEFAULT_USAGE_CACHE_TTL
+    return val if val >= 0 else _DEFAULT_USAGE_CACHE_TTL
 
 
 def _format_usage_lines(usage: dict) -> list[str]:
@@ -1303,6 +1329,60 @@ class ClaudeAccountSwitcher:
             return USAGE_TOKEN_EXPIRED
         return usage
 
+    def _fetch_account_usage(
+        self, account_info: tuple[int, str, str, str, bool, str]
+    ) -> dict | str | None:
+        """Fetch one account's usage entry (no cache, single network call).
+
+        Returns a usage dict, a sentinel string (``USAGE_API_KEY`` /
+        ``USAGE_NO_CREDENTIALS`` / ``USAGE_TOKEN_EXPIRED``), or ``None`` when the
+        fetch failed. The single per-account fetch used by both the parallel
+        ``_collect_usage`` path and the serial ``collect_usage_serial`` daemon path,
+        so the active-vs-session refresh nuance lives in exactly one place.
+        """
+        num, email, _, _, is_active, creds = account_info
+        if looks_like_api_key(creds):
+            # Managed API-key account: no subscription quota to fetch.
+            return USAGE_API_KEY
+        if not creds or not oauth.extract_access_token(creds):
+            return USAGE_NO_CREDENTIALS
+
+        # The active/default account owns the live credential — route it through
+        # the owner-aware path that refreshes only when no Claude Code/session is
+        # running and writes the rotated credential back to the active store.
+        if is_active:
+            return self._fetch_active_usage(str(num), email, creds)
+
+        def persist(acct_num: str, acct_email: str, new_creds: str) -> None:
+            with FileLock(self.lock_file):
+                self._write_account_credentials(acct_num, acct_email, new_creds)
+
+        # An account running in session mode is "inactive" here but live
+        # in its own config dir, where claude manages the token. Treat it
+        # like the active account (no proactive refresh / 401-retry):
+        # refreshing the backup copy could rotate the refresh token out
+        # from under the live session. Worst case its usage shows as
+        # unavailable until the session exits.
+        has_live_session = bool(self._live_session_pids(str(num), email))
+
+        return oauth.fetch_usage_for_account(
+            str(num), email, creds,
+            is_active=has_live_session,
+            persist_credentials=persist,
+        )
+
+    def _write_usage_cache(
+        self,
+        accounts_info: list[tuple[int, str, str, str, bool, str]],
+        usages: list[dict | str | None],
+    ) -> None:
+        """Persist per-account usage entries to ``<backup>/cache/usage.json``."""
+        usage_cache_path = self.backup_dir / "cache" / "usage.json"
+        write_cache(usage_cache_path, {
+            str(info[0]): usage
+            for info, usage in zip(accounts_info, usages)
+        })
+
     def _collect_usage(
         self, accounts_info: list[tuple[int, str, str, str, bool, str]]
     ) -> list[dict | str | None]:
@@ -1310,56 +1390,87 @@ class ClaudeAccountSwitcher:
 
         Each entry is a usage dict, the string ``"no credentials"``, or ``None``
         when the API call failed. Results are cached under
-        ``<backup_dir>/cache/usage.json`` for ``_USAGE_CACHE_TTL`` seconds and
-        reused only when the cache covers exactly the same set of accounts.
+        ``<backup_dir>/cache/usage.json`` for ``_usage_cache_ttl()`` seconds and
+        reused only when the cache covers exactly the same set of accounts (so a
+        fresh cache the ``cswap-quotad`` daemon wrote is served without any fetch).
         """
-        def fetch(
-            account_info: tuple[int, str, str, str, bool, str]
-        ) -> dict | str | None:
-            num, email, _, _, is_active, creds = account_info
-            if looks_like_api_key(creds):
-                # Managed API-key account: no subscription quota to fetch.
-                return USAGE_API_KEY
-            if not creds or not oauth.extract_access_token(creds):
-                return USAGE_NO_CREDENTIALS
-
-            # The active/default account owns the live credential — route it through
-            # the owner-aware path that refreshes only when no Claude Code/session is
-            # running and writes the rotated credential back to the active store.
-            if is_active:
-                return self._fetch_active_usage(str(num), email, creds)
-
-            def persist(acct_num: str, acct_email: str, new_creds: str) -> None:
-                with FileLock(self.lock_file):
-                    self._write_account_credentials(acct_num, acct_email, new_creds)
-
-            # An account running in session mode is "inactive" here but live
-            # in its own config dir, where claude manages the token. Treat it
-            # like the active account (no proactive refresh / 401-retry):
-            # refreshing the backup copy could rotate the refresh token out
-            # from under the live session. Worst case its usage shows as
-            # unavailable until the session exits.
-            has_live_session = bool(self._live_session_pids(str(num), email))
-
-            return oauth.fetch_usage_for_account(
-                str(num), email, creds,
-                is_active=has_live_session,
-                persist_credentials=persist,
-            )
-
         usage_cache_path = self.backup_dir / "cache" / "usage.json"
-        cached = read_cache(usage_cache_path, _USAGE_CACHE_TTL)
+        cached = read_cache(usage_cache_path, _usage_cache_ttl())
         account_keys = {str(info[0]) for info in accounts_info}
         if cached is not MISSING and isinstance(cached, dict) and cached.keys() == account_keys:
             return [cached.get(str(info[0])) for info in accounts_info]
 
         with ThreadPoolExecutor() as executor:
-            usages = list(executor.map(fetch, accounts_info))
-        write_cache(usage_cache_path, {
-            str(info[0]): usage
-            for info, usage in zip(accounts_info, usages)
-        })
+            usages = list(executor.map(self._fetch_account_usage, accounts_info))
+        self._write_usage_cache(accounts_info, usages)
         return usages
+
+    def collect_usage_serial(
+        self,
+        accounts_info: list[tuple[int, str, str, str, bool, str]],
+        spacing_seconds: float = 0.0,
+        sleep_fn: Callable[[float], None] = time.sleep,
+        preserve_last_good: bool = False,
+    ) -> list[dict | str | None]:
+        """Fetch usage one account at a time, spaced, ignoring the read cache.
+
+        Unlike ``_collect_usage`` this never serves a cached result and never runs
+        requests in parallel: it fetches each account exactly once, in turn,
+        sleeping ``spacing_seconds`` *between* calls (not before the first, not
+        after the last). This is the rate-limit-safe path the ``cswap-quotad``
+        daemon uses to keep ``<backup>/cache/usage.json`` fresh without ever
+        tripping HTTP 429. Results are written to that same cache in the native
+        format every other reader (CLI/TUI/CombusDesktop) already understands.
+
+        Deliberately no per-account retry: a failed fetch (``None``) is often a
+        transient 429, and re-hitting it would amplify calls precisely when the
+        endpoint is complaining. The next cycle is the natural backoff instead.
+
+        ``preserve_last_good`` carries an account's previous cached usage forward
+        when this sweep's fetch returns ``None`` (a transient failure), so a blip
+        never blanks a value that was known good — classic stale-while-revalidate.
+        Definitive sentinels (``USAGE_NO_CREDENTIALS`` / ``USAGE_API_KEY`` /
+        ``USAGE_TOKEN_EXPIRED``) still overwrite, and an account dropped from the
+        roster simply falls out of the cache. Off by default so ``_collect_usage``
+        and other callers are unaffected.
+        """
+        usages: list[dict | str | None] = []
+        first_call = True
+        for account_info in accounts_info:
+            if not first_call and spacing_seconds > 0:
+                sleep_fn(spacing_seconds)
+            first_call = False
+            usages.append(self._fetch_account_usage(account_info))
+        if preserve_last_good:
+            usages = self._preserve_last_good(accounts_info, usages)
+        self._write_usage_cache(accounts_info, usages)
+        return usages
+
+    def _preserve_last_good(
+        self,
+        accounts_info: list[tuple[int, str, str, str, bool, str]],
+        usages: list[dict | str | None],
+    ) -> list[dict | str | None]:
+        """Carry a prior good usage entry forward where this sweep failed (None).
+
+        Reads the existing cache regardless of age; for any account whose new
+        value is ``None`` but whose previous value was a usage dict, keeps the
+        previous dict. Everything else (fresh dicts, sentinels) passes through.
+        """
+        prior = read_cache(self.backup_dir / "cache" / "usage.json", float("inf"))
+        if prior is MISSING or not isinstance(prior, dict):
+            return usages
+        merged: list[dict | str | None] = []
+        for info, new in zip(accounts_info, usages):
+            key = str(info[0])
+            if new is None and isinstance(prior.get(key), dict):
+                self._logger.info(
+                    "Usage fetch failed for account %s; keeping last-known value", key
+                )
+                merged.append(prior[key])
+            else:
+                merged.append(new)
+        return merged
 
     def _usage_by_account(self) -> dict[str, dict | str | None]:
         """Map account number → usage entry (cache-first) for managed accounts."""
@@ -1561,7 +1672,7 @@ class ClaudeAccountSwitcher:
         if not creds or not oauth.extract_access_token(creds):
             return USAGE_NO_CREDENTIALS
         usage_cache_path = self.backup_dir / "cache" / "usage.json"
-        cached = read_cache(usage_cache_path, _USAGE_CACHE_TTL)
+        cached = read_cache(usage_cache_path, _usage_cache_ttl())
         if (cached is not MISSING and isinstance(cached, dict)
                 and account_num in cached):
             return cached[account_num]

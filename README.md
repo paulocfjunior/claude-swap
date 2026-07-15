@@ -176,6 +176,39 @@ Every payload carries a `schemaVersion` (currently `1`); on a handled error stdo
 
 </details>
 
+### Quota daemon (`cswap-quotad`)
+
+Every `cswap --list`/`--status` and any tool that shells out to them fetches all accounts' usage from Anthropic's usage API. Those reads happen in parallel and are only cached briefly, so several unsynchronized pollers (a menubar app, the `--watch` TUI, ad-hoc scripts) can burst the endpoint into `HTTP 429` and leave the cache empty.
+
+`cswap-quotad` fixes this by being the single fetcher. It polls each account **serially**, spaced so it never trips the rate limit, and writes the results to the same cache file every other reader already uses (`<backup>/cache/usage.json`). With the usage-cache TTL raised (see below), every `cswap`/TUI/other read is served from that daemon-written cache and never calls the API itself. If the daemon stops, the cache simply ages out and `cswap` transparently falls back to fetching on its own.
+
+Run it (foreground, for a quick look):
+
+```bash
+cswap-quotad                 # loop forever
+cswap-quotad --once          # a single serial sweep, then exit
+cswap-quotad --print-config-path
+```
+
+As a background service on macOS, use the launchd agent in [`launchd/com.claude-swap.quotad.plist`](launchd/com.claude-swap.quotad.plist) (install steps are in the file's header comment).
+
+**Configuration** lives at `<backup>/quota-daemon.json` and is re-read at the top of every cycle, so edits take effect on the next cycle with **no restart** (hot-reload). Adding an account with `cswap --add-account` is picked up automatically too.
+
+```json
+{
+  "enabled": true,
+  "spacing_seconds": 20,
+  "cycle_seconds": 45,
+  "accounts": "all"
+}
+```
+
+- `spacing_seconds` — gap between per-account calls (conservative by default; keeps sweeps rate-safe).
+- `cycle_seconds` — idle gap between full sweeps.
+- `accounts` — `"all"` or a list of account numbers, e.g. `[1, 3]`.
+
+**Cache freshness.** Set `CSWAP_USAGE_CACHE_TTL` (seconds) to control how long `cswap` trusts the cache before fetching itself; it defaults to `300`. Raise it (or keep the daemon running) to avoid ad-hoc fetches; set `0` to always fetch (the pre-daemon behavior).
+
 ### Add an account from a raw token or API key
 
 If you only have a long-lived setup-token (e.g., produced by `claude setup-token`)
