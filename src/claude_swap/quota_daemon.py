@@ -23,6 +23,18 @@ from ``sequence.json`` each cycle too.
 The daemon never switches accounts and never writes credentials beyond the
 refresh-and-persist that cswap's own usage fetch already performs for inactive
 accounts.
+
+Two properties exist because a daemon is not a CLI run. First, the credential
+store's Keychain-usability cache is *sticky per process* — correct for a one-shot
+command, fatal here: one 5-second ``security`` timeout on 2026-08-13 left the
+daemon reading the active credential in file-fallback mode (where macOS has no
+file) for five days, reporting a false "no credentials" for the very account
+``quota-autoswap.sh`` guards while the other accounts read fine. Every cycle now
+re-arms that probe, so a blip heals within one cycle. Second, blindness is
+*loud*: the sweep summary names the accounts it could not read, and losing sight
+of the ACTIVE account logs a WARNING with a consecutive-sweep count rather than
+blending into an idle-looking log. ``stale_after_seconds`` bounds how old the
+active account's last real reading may get before that fires.
 """
 
 from __future__ import annotations
@@ -37,7 +49,7 @@ from pathlib import Path
 from typing import Any
 
 from claude_swap.paths import get_backup_root
-from claude_swap.switcher import ClaudeAccountSwitcher
+from claude_swap.switcher import ClaudeAccountSwitcher, usage_entry_age
 
 _logger = logging.getLogger("cswap-quotad")
 
@@ -53,6 +65,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "spacing_seconds": 20,
     "cycle_seconds": 45,
     "accounts": "all",
+    # How old the ACTIVE account's last real reading may get before a sweep calls
+    # the daemon blind. Matches the default usage-cache TTL: past this, consumers
+    # would be acting on a number nobody has confirmed.
+    "stale_after_seconds": 300,
 }
 
 # Floors so a bad/aggressive config edit can never turn the daemon into a 429
@@ -60,6 +76,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
 # never burst), but multi-account sweeps below the floor are clamped up.
 _MIN_SPACING_SECONDS = 0.0
 _MIN_CYCLE_SECONDS = 5.0
+# Below a sweep's own duration a "stale" verdict would fire on every cycle by
+# construction, so keep the floor above the cadence of a realistic sweep.
+_MIN_STALE_AFTER_SECONDS = 30.0
 
 
 def config_path() -> Path:
@@ -119,6 +138,11 @@ def load_config(path: Path | None = None) -> dict[str, Any]:
         "cycle_seconds": _coerce_number(
             raw.get("cycle_seconds"), DEFAULT_CONFIG["cycle_seconds"], _MIN_CYCLE_SECONDS
         ),
+        "stale_after_seconds": _coerce_number(
+            raw.get("stale_after_seconds"),
+            DEFAULT_CONFIG["stale_after_seconds"],
+            _MIN_STALE_AFTER_SECONDS,
+        ),
         "accounts": accounts,
     }
 
@@ -146,20 +170,98 @@ def _select_accounts(
     return [info for info in accounts_info if str(info[0]) in selector]
 
 
-def _summarize(usages: list[dict | str | None]) -> str:
-    """One-line human summary of a sweep's outcome for the log."""
+def _summarize(
+    selected: list[tuple[int, str, str, str, bool, str]],
+    usages: list[dict | str | None],
+) -> str:
+    """One-line human summary of a sweep's outcome for the log.
+
+    Names the accounts that did *not* produce a reading. The bare counts this used
+    to print ("1 ok, 2 unavailable/sentinel") looked identical whether the missing
+    account was an idle spare or the one the watchdog guards.
+    """
     ok = sum(1 for u in usages if isinstance(u, dict))
     other = len(usages) - ok
-    return f"{ok} ok, {other} unavailable/sentinel"
+    summary = f"{ok} ok, {other} unavailable/sentinel"
+    missing = [
+        f"#{info[0]}{' (ACTIVE)' if info[4] else ''}"
+        f"={'no data' if usage is None else repr(usage)}"
+        for info, usage in zip(selected, usages)
+        if not isinstance(usage, dict)
+    ]
+    return f"{summary} [{', '.join(missing)}]" if missing else summary
+
+
+def _blind_reason(usage: dict | str | None, stale_after: float) -> str | None:
+    """Why this sweep cannot see an account, or ``None`` when the reading is good.
+
+    A sentinel counts as blindness for the ACTIVE slot: "no credentials" there has
+    proven to mean "the credential store could not be read" as often as it means a
+    real logout, and either way there is no number to act on.
+    """
+    if usage is None:
+        return "fetch returned no data"
+    if isinstance(usage, str):
+        return f"reported as {usage!r}"
+    age = usage_entry_age(usage)
+    if age is not None and age > stale_after:
+        return (
+            f"serving a preserved reading {int(age)}s old "
+            f"(over the {int(stale_after)}s limit)"
+        )
+    return None
+
+
+class ActiveAccountWatch:
+    """Tracks whether the daemon can see the ACTIVE account, sweep over sweep.
+
+    The active slot is the one ``quota-autoswap.sh`` guards, so losing sight of it
+    is the failure that matters: every other account can read perfectly while the
+    guarded one is invisible, and because the cache carries a single top-level
+    timestamp that each sweep rewrites, the file still looks fresh. Nothing in the
+    old logs distinguished that state from a healthy idle daemon.
+    """
+
+    def __init__(self) -> None:
+        self.blind_streak = 0
+
+    def observe(self, number: int, reason: str | None) -> None:
+        """Record this sweep's verdict for the active account and log the change."""
+        if reason is None:
+            if self.blind_streak:
+                _logger.info(
+                    "Active account #%s is readable again after %d blind sweep(s)",
+                    number, self.blind_streak,
+                )
+            self.blind_streak = 0
+            return
+        self.blind_streak += 1
+        _logger.warning(
+            "BLIND: active account #%s %s. This is the account autoswap guards, so "
+            "it cannot act while this persists (%d consecutive sweep(s))",
+            number, reason, self.blind_streak,
+        )
 
 
 def run_cycle(
-    switcher: ClaudeAccountSwitcher, cfg: dict[str, Any]
+    switcher: ClaudeAccountSwitcher,
+    cfg: dict[str, Any],
+    watch: ActiveAccountWatch | None = None,
 ) -> list[dict | str | None]:
     """Run one serial sweep over the selected accounts and write the cache.
 
     Returns the per-account usage entries (also persisted to the global cache).
     """
+    # A cycle is this daemon's equivalent of a fresh CLI run, so re-arm Keychain
+    # probing first: the store's usability cache is sticky by design, and without
+    # this a single transient `security` timeout would keep every later
+    # active-credential read in file-fallback mode for the life of the process.
+    if switcher.reset_keychain_capability():
+        _logger.warning(
+            "Keychain was marked unusable by an earlier failure; re-probing it this "
+            "cycle (a transient failure must not blind the daemon permanently)"
+        )
+
     accounts_info = switcher._build_accounts_info()
     selected = _select_accounts(accounts_info, cfg["accounts"])
     if not selected:
@@ -177,7 +279,23 @@ def run_cycle(
         spacing_seconds=cfg["spacing_seconds"],
         preserve_last_good=True,
     )
-    _logger.info("Sweep complete: %s", _summarize(usages))
+    _logger.info("Sweep complete: %s", _summarize(selected, usages))
+
+    stale_after = cfg.get("stale_after_seconds", DEFAULT_CONFIG["stale_after_seconds"])
+    active = next((pair for pair in zip(selected, usages) if pair[0][4]), None)
+    if active is None:
+        # No row is flagged active: either active detection failed or the accounts
+        # filter excludes it. Either way the watchdog has nothing to judge, which is
+        # its own kind of blindness and must not pass silently.
+        _logger.warning(
+            "No ACTIVE account in this sweep (active detection failed, or the "
+            "accounts filter excludes it); autoswap has nothing to judge"
+        )
+    else:
+        info, usage = active
+        (watch or ActiveAccountWatch()).observe(
+            info[0], _blind_reason(usage, stale_after)
+        )
     return usages
 
 
@@ -208,6 +326,7 @@ def run(config_file: Path | None = None, once: bool = False) -> int:
     """Daemon main loop. Returns a process exit code."""
     ensure_config_file(config_file)
     switcher = ClaudeAccountSwitcher()
+    watch = ActiveAccountWatch()
 
     stop = _StopSignal()
     signal.signal(signal.SIGTERM, stop.request_stop)
@@ -225,7 +344,7 @@ def run(config_file: Path | None = None, once: bool = False) -> int:
             continue
 
         try:
-            run_cycle(switcher, cfg)
+            run_cycle(switcher, cfg, watch)
         except Exception:  # noqa: BLE001 - never let one bad cycle kill the daemon
             _logger.exception("Cycle failed; continuing")
 

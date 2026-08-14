@@ -933,6 +933,55 @@ class TestActiveAccountRefresh:
         assert result == USAGE_NO_CREDENTIALS
         mock_fetch.assert_not_called()
 
+    def test_unreadable_store_reports_unknown_not_no_credentials(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, caplog
+    ):
+        """An empty ACTIVE credential read proves nothing once the Keychain has failed.
+
+        This is the blind spot that let cswap-quotad publish "no credentials" for the
+        account the autoswap watchdog guards: the store had flipped to file-fallback
+        mode after one transient timeout, and the active credential has no file on
+        macOS. `None` (unknown) is the honest answer, and unlike the sentinel it lets
+        preserve_last_good keep the last real reading.
+        """
+        switcher = self._switcher(sample_sequence_data)
+        switcher._keychain_usable_cache = False  # a Keychain op failed this run
+        active_row = (1, "test@example.com", "", "", True, "")
+
+        with caplog.at_level("WARNING"):
+            result = switcher._fetch_account_usage(active_row)
+
+        assert result is None
+        assert "could not be read" in caplog.text
+
+    def test_healthy_store_still_reports_no_credentials(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """With the Keychain working, an empty read is a real logout — keep the sentinel."""
+        from claude_swap.json_output import USAGE_NO_CREDENTIALS
+
+        switcher = self._switcher(sample_sequence_data)
+        switcher._keychain_usable_cache = True
+        active_row = (1, "test@example.com", "", "", True, "")
+
+        assert switcher._fetch_account_usage(active_row) == USAGE_NO_CREDENTIALS
+
+    def test_inactive_account_keeps_sentinel_even_when_keychain_flipped(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """Only the ACTIVE slot is ambiguous.
+
+        `_read_account_credentials` queries the Keychain ungated by the usability
+        cache, so an empty backup read means the backup really is absent.
+        """
+        from claude_swap.json_output import USAGE_NO_CREDENTIALS
+
+        switcher = self._switcher(sample_sequence_data)
+        switcher._keychain_usable_cache = False
+        inactive_row = (2, "other@example.com", "", "", False, "")
+
+        assert switcher._fetch_account_usage(inactive_row) == USAGE_NO_CREDENTIALS
+
     def test_list_renders_token_expired_line(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
     ):
@@ -3094,6 +3143,31 @@ class TestMacosKeychainFallback:
         monkeypatch.setattr(macos_keychain, "get_password", lambda *a, **k: "ok")
         s._kc_call(macos_keychain.get_password, "svc", "acct")
         assert s._use_keychain() is False
+
+    def test_reset_re_arms_the_probe_for_long_lived_callers(self, temp_home: Path):
+        """The sticky flip needs an explicit escape hatch for daemons.
+
+        Stickiness is right within one CLI run, but cswap-quotad reuses a switcher
+        for days: one transient timeout would otherwise route every later
+        active-credential read to a file that does not exist on macOS, which is how
+        the daemon spent five days publishing a false "no credentials".
+        """
+        s = self._macos_switcher()
+        s._keychain_usable_cache = False
+
+        assert s._store.keychain_marked_unusable() is True
+        assert s.reset_keychain_capability() is True  # reports it actually cleared one
+        assert s._use_keychain() is True
+        assert s._store.keychain_marked_unusable() is False
+
+        # Idempotent, and silent when there was nothing to clear.
+        assert s.reset_keychain_capability() is False
+
+    def test_reset_does_not_disturb_a_healthy_probe(self, temp_home: Path):
+        s = self._macos_switcher()
+        s._keychain_usable_cache = True
+        assert s.reset_keychain_capability() is False
+        assert s._keychain_usable_cache is True
 
     def test_item_exists_is_capability_neutral(
         self, temp_home: Path, block_real_keychain

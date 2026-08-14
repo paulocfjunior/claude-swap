@@ -28,6 +28,7 @@ from claude_swap.cache import MISSING, read_cache, write_cache
 from claude_swap.json_output import (
     SCHEMA_VERSION,
     USAGE_API_KEY,
+    USAGE_FETCHED_AT_KEY,
     USAGE_NO_CREDENTIALS,
     USAGE_TOKEN_EXPIRED,
     account_ref,
@@ -102,6 +103,29 @@ def _usage_cache_ttl() -> float:
     except ValueError:
         return _DEFAULT_USAGE_CACHE_TTL
     return val if val >= 0 else _DEFAULT_USAGE_CACHE_TTL
+
+
+def usage_entry_age(entry: object) -> float | None:
+    """Seconds since ``entry`` was fetched, or ``None`` when it carries no stamp.
+
+    Only entries written by ``collect_usage_serial`` are stamped (see
+    ``USAGE_FETCHED_AT_KEY``). ``None`` means "cannot tell from the entry alone" —
+    fall back to the cache file's top-level timestamp — never "fresh".
+    """
+    if not isinstance(entry, dict):
+        return None
+    stamp = entry.get(USAGE_FETCHED_AT_KEY)
+    if not isinstance(stamp, (int, float)) or isinstance(stamp, bool):
+        return None
+    return time.time() - float(stamp)
+
+
+def _describe_entry_age(entry: object) -> str:
+    """Human phrase for how old a usage entry is, for log lines."""
+    age = usage_entry_age(entry)
+    if age is None:
+        return "age unknown"
+    return f"fetched {int(age)}s ago"
 
 
 def _format_usage_lines(usage: dict) -> list[str]:
@@ -310,6 +334,16 @@ class ClaudeAccountSwitcher:
 
     def _read_credentials(self) -> str | None:
         return self._store._read_credentials()
+
+    def reset_keychain_capability(self) -> bool:
+        """Re-arm Keychain probing after an earlier failure this run.
+
+        For long-lived callers (``cswap-quotad``) that reuse one switcher across
+        cycles: without this, a single transient ``security`` timeout would keep the
+        store in file-fallback mode for the life of the process. Returns ``True``
+        when a flipped cache was actually cleared.
+        """
+        return self._store.reset_keychain_capability()
 
     def _write_credentials(self, credentials: str) -> None:
         self._store._write_credentials(credentials)
@@ -1345,6 +1379,20 @@ class ClaudeAccountSwitcher:
             # Managed API-key account: no subscription quota to fetch.
             return USAGE_API_KEY
         if not creds or not oauth.extract_access_token(creds):
+            if is_active and self._store.keychain_marked_unusable():
+                # A Keychain op already failed this run, so the store is routing to
+                # files — and the *active* credential has no file on macOS (Claude
+                # Code keeps it in the Keychain). An empty read therefore means "I
+                # could not look", not "there is no login". Report unknown so
+                # preserve_last_good keeps the last real reading, instead of letting
+                # a definitive-sounding sentinel overwrite it with a lie.
+                self._logger.warning(
+                    "Account %s is ACTIVE but its credential could not be read "
+                    "(Keychain unusable this run); reporting usage as unknown "
+                    "rather than 'no credentials'",
+                    num,
+                )
+                return None
             return USAGE_NO_CREDENTIALS
 
         # The active/default account owns the live credential — route it through
@@ -1433,6 +1481,15 @@ class ClaudeAccountSwitcher:
         ``USAGE_TOKEN_EXPIRED``) still overwrite, and an account dropped from the
         roster simply falls out of the cache. Off by default so ``_collect_usage``
         and other callers are unaffected.
+
+        Every freshly fetched entry is stamped with ``fetched_at`` (epoch seconds)
+        *before* preservation runs, so a carried-forward value keeps its ORIGINAL
+        stamp. Without it a preserved reading is indistinguishable from a fresh one:
+        the cache has a single top-level timestamp that every sweep rewrites, so the
+        accounts that did succeed keep making a pinned value look current. Consumers
+        that must not act on an old number (the autoswap watchdog) read this stamp;
+        a missing one means the writer was the parallel path, where every entry is
+        as fresh as the file timestamp.
         """
         usages: list[dict | str | None] = []
         first_call = True
@@ -1440,7 +1497,10 @@ class ClaudeAccountSwitcher:
             if not first_call and spacing_seconds > 0:
                 sleep_fn(spacing_seconds)
             first_call = False
-            usages.append(self._fetch_account_usage(account_info))
+            usage = self._fetch_account_usage(account_info)
+            if isinstance(usage, dict):
+                usage = {**usage, USAGE_FETCHED_AT_KEY: time.time()}
+            usages.append(usage)
         if preserve_last_good:
             usages = self._preserve_last_good(accounts_info, usages)
         self._write_usage_cache(accounts_info, usages)
@@ -1465,7 +1525,9 @@ class ClaudeAccountSwitcher:
             key = str(info[0])
             if new is None and isinstance(prior.get(key), dict):
                 self._logger.info(
-                    "Usage fetch failed for account %s; keeping last-known value", key
+                    "Usage fetch failed for account %s; keeping last-known value (%s)",
+                    key,
+                    _describe_entry_age(prior[key]),
                 )
                 merged.append(prior[key])
             else:

@@ -11,7 +11,8 @@ reads its live configuration (``platform``, ``_logger``, ``credentials_dir``)
 from a host *view* — a small data-only window onto the switcher that constructs
 it — and must never call a switcher *method* through that host, or storage and
 orchestration would re-couple. The store owns only its two pieces of state:
-``_keychain_usable_cache`` (sticky, process-local) and
+``_keychain_usable_cache`` (sticky, process-local — a long-lived caller should
+call ``reset_keychain_capability`` periodically so one blip is not permanent) and
 ``_last_active_credentials_backend`` (for the post-switch follow-up message).
 """
 
@@ -139,6 +140,35 @@ class CredentialStore:
         if self._host.platform != Platform.MACOS:
             return False
         return self._keychain_usable_cache is not False
+
+    def keychain_marked_unusable(self) -> bool:
+        """Whether a Keychain op has already failed this run (routing is in file mode).
+
+        Lets a caller tell "this account genuinely has no credentials" apart from
+        "I could not read the store": with the cache flipped, an empty read proves
+        nothing about whether a credential exists.
+        """
+        return self._keychain_usable_cache is False
+
+    def reset_keychain_capability(self) -> bool:
+        """Forget a previous Keychain failure so the next op probes for real again.
+
+        The sticky flip in ``_kc_call`` is right for a one-shot CLI run: a single
+        invocation must not split-brain between backends mid-way. It is wrong for a
+        *long-lived* process, which would inherit one transient failure forever — a
+        5-second ``security`` timeout once blinded ``cswap-quotad`` for five days,
+        because the daemon reuses a single switcher across cycles and the flip made
+        every later active-credential read return "" (its macOS fallbacks do not
+        exist), which surfaced as a false "no credentials".
+
+        A daemon *cycle* is the moral equivalent of a fresh run, so the daemon calls
+        this at the top of each one and a transient blip self-heals within a cycle.
+        Returns ``True`` when a flipped cache was actually cleared (worth logging).
+        """
+        if self._keychain_usable_cache is False:
+            self._keychain_usable_cache = None
+            return True
+        return False
 
     def _read_credentials(self) -> str | None:
         """Read Claude Code's active credential — OAuth *or* managed API key.

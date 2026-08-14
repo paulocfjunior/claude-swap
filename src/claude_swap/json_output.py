@@ -20,6 +20,15 @@ USAGE_TOKEN_EXPIRED = "token expired"
 # reported as this sentinel instead of being fetched from the OAuth usage API.
 USAGE_API_KEY = "api key"
 
+# Key stamped into a usage dict by ``collect_usage_serial`` recording when that
+# entry was actually fetched (epoch seconds). The cache file has ONE top-level
+# timestamp that every sweep rewrites, so it says when the *file* was written, not
+# how old any single account's number is — a value carried forward by
+# ``preserve_last_good`` keeps looking current forever. Consumers that must not act
+# on a stale reading check this. Deliberately NOT projected by ``usage_to_json``:
+# it is cache bookkeeping, not part of the v1 payload schema.
+USAGE_FETCHED_AT_KEY = "fetched_at"
+
 
 def _window_to_json(entry: dict) -> dict:
     """Project a 5h/7d usage window to JSON, preserving raw ``resetsAt``."""
