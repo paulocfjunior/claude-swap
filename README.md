@@ -199,13 +199,17 @@ As a background service on macOS, use the launchd agent in [`launchd/com.claude-
   "enabled": true,
   "spacing_seconds": 20,
   "cycle_seconds": 45,
+  "stale_after_seconds": 300,
   "accounts": "all"
 }
 ```
 
 - `spacing_seconds` — gap between per-account calls (conservative by default; keeps sweeps rate-safe).
 - `cycle_seconds` — idle gap between full sweeps.
+- `stale_after_seconds` — how old the **active** account's last real reading may get before a sweep logs a `BLIND` warning. A failed fetch keeps the previous value rather than blanking it, so without this bound a frozen number would look current indefinitely.
 - `accounts` — `"all"` or a list of account numbers, e.g. `[1, 3]`.
+
+**Losing sight of the active account is reported, not hidden.** The active slot is the one an auto-swap watchdog acts on, and it is also the slot most likely to read badly (running Claude Code sessions contend for the same endpoint). So each sweep names the accounts it could not read, and if the active one is missing, stale, or reported by a sentinel, the daemon logs a `BLIND` warning with a count of consecutive affected sweeps. Each entry in the cache also carries `fetched_at`, the moment that specific number was really fetched, because the file's own timestamp is rewritten by every sweep and therefore says nothing about how old any single account's figure is.
 
 **Cache freshness.** Set `CSWAP_USAGE_CACHE_TTL` (seconds) to control how long `cswap` trusts the cache before fetching itself; it defaults to `300`. Raise it (or keep the daemon running) to avoid ad-hoc fetches; set `0` to always fetch (the pre-daemon behavior).
 
