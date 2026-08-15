@@ -148,6 +148,20 @@ def _is_transient_usage(entry: object) -> bool:
     return isinstance(entry, str) and entry not in _DEFINITIVE_SENTINELS
 
 
+# How long a reading may keep being carried forward before the daemon stops
+# republishing it. Preservation answers "what may be kept"; this answers "for how
+# long", and without it a value is pinned forever: an account that never reads
+# again keeps publishing the last number it ever produced.
+#
+# Chosen above the 5-minute pre-expiry token window (see _DEFINITIVE_SENTINELS) so
+# an ordinary refresh cycle survives intact, and deliberately LONGER than the
+# consumers' own staleness limit. Those are two different jobs: a consumer decides
+# at ~5 minutes that it will not ACT on a number this old, while this decides much
+# later that the daemon should stop REPUBLISHING it at all. The alarm should fire
+# well before the data disappears, or the alarm loses its evidence.
+_MAX_PRESERVE_SECONDS = 900.0
+
+
 def _describe_entry_age(entry: object) -> str:
     """Human phrase for how old a usage entry is, for log lines."""
     age = usage_entry_age(entry)
@@ -1487,6 +1501,7 @@ class ClaudeAccountSwitcher:
         spacing_seconds: float = 0.0,
         sleep_fn: Callable[[float], None] = time.sleep,
         preserve_last_good: bool = False,
+        max_preserve_seconds: float = _MAX_PRESERVE_SECONDS,
     ) -> list[dict | str | None]:
         """Fetch usage one account at a time, spaced, ignoring the read cache.
 
@@ -1512,6 +1527,8 @@ class ClaudeAccountSwitcher:
         so treating it as settled blanked the guarded account's number on a
         schedule. An account dropped from the roster simply falls out of the cache.
         Off by default so ``_collect_usage`` and other callers are unaffected.
+        Preservation is bounded by ``max_preserve_seconds``: past that a reading is
+        reported as unknown rather than republished forever.
 
         Every freshly fetched entry is stamped with ``fetched_at`` (epoch seconds)
         *before* preservation runs, so a carried-forward value keeps its ORIGINAL
@@ -1533,7 +1550,9 @@ class ClaudeAccountSwitcher:
                 usage = {**usage, USAGE_FETCHED_AT_KEY: time.time()}
             usages.append(usage)
         if preserve_last_good:
-            usages = self._preserve_last_good(accounts_info, usages)
+            usages = self._preserve_last_good(
+                accounts_info, usages, max_preserve_seconds
+            )
         self._write_usage_cache(accounts_info, usages)
         return usages
 
@@ -1541,6 +1560,7 @@ class ClaudeAccountSwitcher:
         self,
         accounts_info: list[tuple[int, str, str, str, bool, str]],
         usages: list[dict | str | None],
+        max_preserve_seconds: float = _MAX_PRESERVE_SECONDS,
     ) -> list[dict | str | None]:
         """Carry a prior good usage entry forward where this sweep learned nothing.
 
@@ -1554,6 +1574,14 @@ class ClaudeAccountSwitcher:
         settled ("token expired") when the truth is "ask again in a minute". A
         consumer cannot tell those apart, so the watchdog goes blind on a condition
         that was about to resolve itself.
+
+        Preservation is BOUNDED by ``max_preserve_seconds``. Carrying a value
+        forward is a bet that the next sweep will succeed; once a reading is old
+        enough that the bet has clearly failed, republishing it is its own lie, so
+        the account goes to ``None`` (unknown) instead. An entry with no
+        ``fetched_at`` cannot be dated, so it is kept: the parallel writer produces
+        those and they are fresh when written. The next successful fetch stamps it,
+        which is what closes that window in practice.
         """
         prior = read_cache(self.backup_dir / "cache" / "usage.json", float("inf"))
         if prior is MISSING or not isinstance(prior, dict):
@@ -1561,16 +1589,29 @@ class ClaudeAccountSwitcher:
         merged: list[dict | str | None] = []
         for info, new in zip(accounts_info, usages):
             key = str(info[0])
-            if _is_transient_usage(new) and isinstance(prior.get(key), dict):
-                self._logger.info(
-                    "Usage for account %s is %s; keeping last-known value (%s)",
-                    key,
-                    "unavailable" if new is None else f"{new!r} (transient)",
-                    _describe_entry_age(prior[key]),
-                )
-                merged.append(prior[key])
-            else:
+            prior_entry = prior.get(key)
+            if not (_is_transient_usage(new) and isinstance(prior_entry, dict)):
                 merged.append(new)
+                continue
+
+            age = usage_entry_age(prior_entry)
+            if age is not None and age > max_preserve_seconds:
+                self._logger.warning(
+                    "Account %s has had no confirmed reading for %ds, over the %ds "
+                    "preserve limit; reporting it as unknown rather than "
+                    "republishing a number nobody has confirmed since",
+                    key, int(age), int(max_preserve_seconds),
+                )
+                merged.append(None)
+                continue
+
+            self._logger.info(
+                "Usage for account %s is %s; keeping last-known value (%s)",
+                key,
+                "unavailable" if new is None else f"{new!r} (transient)",
+                _describe_entry_age(prior_entry),
+            )
+            merged.append(prior_entry)
         return merged
 
     def _usage_by_account(self) -> dict[str, dict | str | None]:

@@ -115,7 +115,10 @@ def test_preserve_last_good_carries_forward_on_failure(temp_home, monkeypatch):
     # Seed a prior cache: account 1 had a good value last cycle.
     from claude_swap.cache import write_cache
 
-    stale_stamp = time.time() - 3600
+    # Inside _MAX_PRESERVE_SECONDS: old enough that its age is clearly visible,
+    # recent enough that preservation still applies (the bound is covered by
+    # test_preservation_stops_once_the_reading_is_too_old).
+    stale_stamp = time.time() - 120
     write_cache(
         sw.backup_dir / "cache" / "usage.json",
         {
@@ -144,7 +147,7 @@ def test_preserve_last_good_carries_forward_on_failure(temp_home, monkeypatch):
     # even though the cache file's own timestamp was just rewritten. Without this
     # a pinned value is indistinguishable from a current one forever.
     assert cached["1"][USAGE_FETCHED_AT_KEY] == stale_stamp
-    assert usage_entry_age(cached["1"]) > 3000
+    assert usage_entry_age(cached["1"]) > 100
     assert usage_entry_age(cached["2"]) < 60
 
 
@@ -217,6 +220,77 @@ def test_token_expired_passes_through_when_there_is_nothing_to_keep(temp_home, m
     assert sw.collect_usage_serial([_acct(1)], preserve_last_good=True) == [
         USAGE_TOKEN_EXPIRED
     ]
+
+
+def test_preservation_stops_once_the_reading_is_too_old(temp_home, monkeypatch):
+    """Carrying a value forward is a bet the next sweep succeeds; bound the bet.
+
+    Unbounded, an account that never reads again republishes the last number it
+    ever produced, forever, and the cache's own timestamp keeps it looking current.
+    """
+    from claude_swap.cache import write_cache
+
+    sw = ClaudeAccountSwitcher()
+    write_cache(
+        sw.backup_dir / "cache" / "usage.json",
+        {"1": {"seven_day": {"pct": 64.0}, USAGE_FETCHED_AT_KEY: time.time() - 5000}},
+    )
+    monkeypatch.setattr(sw, "_fetch_account_usage", lambda info: None)
+
+    result = sw.collect_usage_serial(
+        [_acct(1)], preserve_last_good=True, max_preserve_seconds=900
+    )
+
+    assert result == [None]  # unknown is honest; the old number would not be
+
+
+def test_a_reading_inside_the_bound_is_still_kept(temp_home, monkeypatch):
+    from claude_swap.cache import write_cache
+
+    sw = ClaudeAccountSwitcher()
+    write_cache(
+        sw.backup_dir / "cache" / "usage.json",
+        {"1": {"seven_day": {"pct": 64.0}, USAGE_FETCHED_AT_KEY: time.time() - 60}},
+    )
+    monkeypatch.setattr(sw, "_fetch_account_usage", lambda info: None)
+
+    result = sw.collect_usage_serial(
+        [_acct(1)], preserve_last_good=True, max_preserve_seconds=900
+    )
+
+    assert _no_stamp(result[0]) == {"seven_day": {"pct": 64.0}}
+
+
+def test_the_bound_outlives_the_token_expiry_window(temp_home, monkeypatch):
+    """The default must not blank a value during an ordinary 5-minute refresh."""
+    from claude_swap.cache import write_cache
+
+    sw = ClaudeAccountSwitcher()
+    write_cache(
+        sw.backup_dir / "cache" / "usage.json",
+        {"1": {"seven_day": {"pct": 64.0}, USAGE_FETCHED_AT_KEY: time.time() - 300}},
+    )
+    monkeypatch.setattr(sw, "_fetch_account_usage", lambda info: USAGE_TOKEN_EXPIRED)
+
+    result = sw.collect_usage_serial([_acct(1)], preserve_last_good=True)
+
+    assert _no_stamp(result[0]) == {"seven_day": {"pct": 64.0}}
+    assert switcher_mod._MAX_PRESERVE_SECONDS > 300  # longer than the expiry buffer
+
+
+def test_an_undatable_entry_is_kept_rather_than_discarded(temp_home, monkeypatch):
+    """No stamp means the parallel writer produced it, which is fresh when written."""
+    from claude_swap.cache import write_cache
+
+    sw = ClaudeAccountSwitcher()
+    write_cache(sw.backup_dir / "cache" / "usage.json", {"1": {"seven_day": {"pct": 64.0}}})
+    monkeypatch.setattr(sw, "_fetch_account_usage", lambda info: None)
+
+    result = sw.collect_usage_serial(
+        [_acct(1)], preserve_last_good=True, max_preserve_seconds=1
+    )
+
+    assert _no_stamp(result[0]) == {"seven_day": {"pct": 64.0}}
 
 
 def test_transient_classification():
