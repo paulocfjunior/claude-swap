@@ -17,7 +17,11 @@ import pytest
 from claude_swap import quota_daemon
 from claude_swap import switcher as switcher_mod
 from claude_swap.cache import read_cache
-from claude_swap.json_output import USAGE_FETCHED_AT_KEY, USAGE_NO_CREDENTIALS
+from claude_swap.json_output import (
+    USAGE_FETCHED_AT_KEY,
+    USAGE_NO_CREDENTIALS,
+    USAGE_TOKEN_EXPIRED,
+)
 from claude_swap.switcher import ClaudeAccountSwitcher, usage_entry_age
 
 
@@ -152,6 +156,74 @@ def test_preserve_last_good_off_by_default_writes_none(temp_home, monkeypatch):
     monkeypatch.setattr(sw, "_fetch_account_usage", lambda info: None)
     result = sw.collect_usage_serial([_acct(1)])  # preserve_last_good defaults False
     assert result == [None]
+
+
+def test_token_expired_does_not_blank_a_good_reading(temp_home, monkeypatch):
+    """TOKEN_EXPIRED is transient, so it must not overwrite a real number.
+
+    `is_oauth_token_expired` counts a token as expired for the 5 minutes BEFORE it
+    lapses, so this sentinel appears around every token expiry while Claude Code is
+    already refreshing. Measured 2026-08-14: it blanked the active account from
+    17:48:43 to 17:53:43, blinded the watchdog for three sweeps, and paged Paulo
+    about a condition that fixed itself.
+    """
+    from claude_swap.cache import write_cache
+
+    sw = ClaudeAccountSwitcher()
+    write_cache(
+        sw.backup_dir / "cache" / "usage.json",
+        {"1": {"seven_day": {"pct": 94.0}, USAGE_FETCHED_AT_KEY: time.time() - 30}},
+    )
+    monkeypatch.setattr(sw, "_fetch_account_usage", lambda info: USAGE_TOKEN_EXPIRED)
+
+    result = sw.collect_usage_serial([_acct(1, is_active=True)], preserve_last_good=True)
+
+    assert _no_stamp(result[0]) == {"seven_day": {"pct": 94.0}}
+
+
+def test_no_credentials_still_overwrites(temp_home, monkeypatch):
+    """A definitive sentinel must still replace a stale value: it is settled news."""
+    from claude_swap.cache import write_cache
+
+    sw = ClaudeAccountSwitcher()
+    write_cache(
+        sw.backup_dir / "cache" / "usage.json", {"1": {"seven_day": {"pct": 94.0}}}
+    )
+    monkeypatch.setattr(sw, "_fetch_account_usage", lambda info: USAGE_NO_CREDENTIALS)
+
+    result = sw.collect_usage_serial([_acct(1)], preserve_last_good=True)
+
+    assert result == [USAGE_NO_CREDENTIALS]
+
+
+def test_api_key_still_overwrites(temp_home, monkeypatch):
+    from claude_swap.cache import write_cache
+    from claude_swap.json_output import USAGE_API_KEY
+
+    sw = ClaudeAccountSwitcher()
+    write_cache(
+        sw.backup_dir / "cache" / "usage.json", {"1": {"seven_day": {"pct": 94.0}}}
+    )
+    monkeypatch.setattr(sw, "_fetch_account_usage", lambda info: USAGE_API_KEY)
+
+    assert sw.collect_usage_serial([_acct(1)], preserve_last_good=True) == [USAGE_API_KEY]
+
+
+def test_token_expired_passes_through_when_there_is_nothing_to_keep(temp_home, monkeypatch):
+    """Preserving is not inventing: with no prior reading the sentinel still shows."""
+    sw = ClaudeAccountSwitcher()
+    monkeypatch.setattr(sw, "_fetch_account_usage", lambda info: USAGE_TOKEN_EXPIRED)
+
+    assert sw.collect_usage_serial([_acct(1)], preserve_last_good=True) == [
+        USAGE_TOKEN_EXPIRED
+    ]
+
+
+def test_transient_classification():
+    assert switcher_mod._is_transient_usage(None) is True
+    assert switcher_mod._is_transient_usage(USAGE_TOKEN_EXPIRED) is True
+    assert switcher_mod._is_transient_usage(USAGE_NO_CREDENTIALS) is False
+    assert switcher_mod._is_transient_usage({"five_hour": {}}) is False
 
 
 def test_preserve_does_not_resurrect_sentinel_or_missing_prior(temp_home, monkeypatch):

@@ -120,6 +120,34 @@ def usage_entry_age(entry: object) -> float | None:
     return time.time() - float(stamp)
 
 
+# Sentinels that state a SETTLED fact about an account, so a fresh one should
+# replace whatever was cached before. Everything not listed here describes a
+# passing condition and must not overwrite a real reading.
+#
+# The default is deliberately "transient", because the failure we keep hitting is a
+# passing condition being published as settled news, twice now. A new sentinel
+# wrongly defaulted to transient only pins a stale number, and that is already
+# bounded: entries carry ``fetched_at`` and consumers treat an over-age reading as
+# no reading. A new sentinel wrongly defaulted to definitive re-creates this bug.
+#
+# ``USAGE_TOKEN_EXPIRED`` is deliberately absent. ``oauth.is_oauth_token_expired``
+# counts a token as expired for the last ``OAUTH_EXPIRY_BUFFER_MS`` (5 minutes)
+# before it actually lapses, so around EVERY token expiry there is a window where a
+# failed fetch plus a soon-to-expire token yields this sentinel while Claude Code is
+# already refreshing. Measured on 2026-08-14: the active account's figure was
+# blanked from 17:48:43 (buffer opened) until 17:53:43 (token refreshed), which blinded
+# the autoswap watchdog for three sweeps and paged Paulo about a condition that
+# resolved itself.
+_DEFINITIVE_SENTINELS = frozenset({USAGE_NO_CREDENTIALS, USAGE_API_KEY})
+
+
+def _is_transient_usage(entry: object) -> bool:
+    """Whether ``entry`` means "ask again later" rather than a settled state."""
+    if entry is None:
+        return True
+    return isinstance(entry, str) and entry not in _DEFINITIVE_SENTINELS
+
+
 def _describe_entry_age(entry: object) -> str:
     """Human phrase for how old a usage entry is, for log lines."""
     age = usage_entry_age(entry)
@@ -1475,12 +1503,15 @@ class ClaudeAccountSwitcher:
         endpoint is complaining. The next cycle is the natural backoff instead.
 
         ``preserve_last_good`` carries an account's previous cached usage forward
-        when this sweep's fetch returns ``None`` (a transient failure), so a blip
-        never blanks a value that was known good — classic stale-while-revalidate.
-        Definitive sentinels (``USAGE_NO_CREDENTIALS`` / ``USAGE_API_KEY`` /
-        ``USAGE_TOKEN_EXPIRED``) still overwrite, and an account dropped from the
-        roster simply falls out of the cache. Off by default so ``_collect_usage``
-        and other callers are unaffected.
+        when this sweep learned nothing new — a ``None`` fetch or a transient
+        sentinel — so a blip never blanks a value that was known good, in the
+        classic stale-while-revalidate shape.
+        Definitive sentinels (``_DEFINITIVE_SENTINELS``) still overwrite, but a
+        *transient* one no longer does: ``USAGE_TOKEN_EXPIRED`` fires for the five
+        minutes before every token expiry while Claude Code is already refreshing,
+        so treating it as settled blanked the guarded account's number on a
+        schedule. An account dropped from the roster simply falls out of the cache.
+        Off by default so ``_collect_usage`` and other callers are unaffected.
 
         Every freshly fetched entry is stamped with ``fetched_at`` (epoch seconds)
         *before* preservation runs, so a carried-forward value keeps its ORIGINAL
@@ -1511,11 +1542,18 @@ class ClaudeAccountSwitcher:
         accounts_info: list[tuple[int, str, str, str, bool, str]],
         usages: list[dict | str | None],
     ) -> list[dict | str | None]:
-        """Carry a prior good usage entry forward where this sweep failed (None).
+        """Carry a prior good usage entry forward where this sweep learned nothing.
 
-        Reads the existing cache regardless of age; for any account whose new
-        value is ``None`` but whose previous value was a usage dict, keeps the
-        previous dict. Everything else (fresh dicts, sentinels) passes through.
+        Reads the existing cache regardless of age. An account whose new value is
+        *non-definitive* — ``None``, or a sentinel that describes a passing
+        condition rather than a settled fact — keeps its previous usage dict.
+        Fresh dicts and DEFINITIVE sentinels pass through and replace it.
+
+        The distinction is the point: overwriting a real number with a transient
+        sentinel does not merely lose data, it publishes something that reads as
+        settled ("token expired") when the truth is "ask again in a minute". A
+        consumer cannot tell those apart, so the watchdog goes blind on a condition
+        that was about to resolve itself.
         """
         prior = read_cache(self.backup_dir / "cache" / "usage.json", float("inf"))
         if prior is MISSING or not isinstance(prior, dict):
@@ -1523,10 +1561,11 @@ class ClaudeAccountSwitcher:
         merged: list[dict | str | None] = []
         for info, new in zip(accounts_info, usages):
             key = str(info[0])
-            if new is None and isinstance(prior.get(key), dict):
+            if _is_transient_usage(new) and isinstance(prior.get(key), dict):
                 self._logger.info(
-                    "Usage fetch failed for account %s; keeping last-known value (%s)",
+                    "Usage for account %s is %s; keeping last-known value (%s)",
                     key,
+                    "unavailable" if new is None else f"{new!r} (transient)",
                     _describe_entry_age(prior[key]),
                 )
                 merged.append(prior[key])
