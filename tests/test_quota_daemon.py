@@ -31,8 +31,8 @@ def _acct(num: int, email: str = "a@example.com", is_active: bool = False):
 
 
 def _no_stamp(entry):
-    """A usage entry without its ``fetched_at`` bookkeeping key, for comparison."""
-    return {k: v for k, v in entry.items() if k != USAGE_FETCHED_AT_KEY}
+    """A usage entry without its bookkeeping keys (fetched_at, email), for comparison."""
+    return {k: v for k, v in entry.items() if k not in (USAGE_FETCHED_AT_KEY, "email")}
 
 
 # --------------------------------------------------------------------------- #

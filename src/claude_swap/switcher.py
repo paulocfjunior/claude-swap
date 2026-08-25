@@ -1461,6 +1461,24 @@ class ClaudeAccountSwitcher:
             persist_credentials=persist,
         )
 
+    @staticmethod
+    def _stamp_email(usage, email: str):
+        """Add the account email to a usage entry, ADDITIVELY.
+
+        A real reading (dict) gets an ``email`` field alongside its existing
+        five_hour / seven_day / fetched_at fields, which are left unchanged.
+        Sentinels (``USAGE_NO_CREDENTIALS`` str) and ``None`` are returned
+        untouched so their type and existing consumers are unaffected. The email
+        lets downstream readers (fleet-now) label accounts by identity instead of
+        by numeric slot; it carries no quota meaning and the quota/autoswap logic
+        does not read it.
+        """
+        if isinstance(usage, dict):
+            out = dict(usage)
+            out["email"] = email
+            return out
+        return usage
+
     def _write_usage_cache(
         self,
         accounts_info: list[tuple[int, str, str, str, bool, str]],
@@ -1469,7 +1487,7 @@ class ClaudeAccountSwitcher:
         """Persist per-account usage entries to ``<backup>/cache/usage.json``."""
         usage_cache_path = self.backup_dir / "cache" / "usage.json"
         write_cache(usage_cache_path, {
-            str(info[0]): usage
+            str(info[0]): self._stamp_email(usage, info[1])
             for info, usage in zip(accounts_info, usages)
         })
 
@@ -1820,7 +1838,7 @@ class ClaudeAccountSwitcher:
             return cached[account_num]
         usage = self._fetch_active_usage(account_num, current_email, creds)
         existing = cached if (cached is not MISSING and isinstance(cached, dict)) else {}
-        existing[account_num] = usage
+        existing[account_num] = self._stamp_email(usage, current_email)
         write_cache(usage_cache_path, existing)
         return usage
 

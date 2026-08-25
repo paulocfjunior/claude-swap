@@ -485,7 +485,7 @@ class TestStatusCache:
         cache_path = switcher.backup_dir / "cache" / "usage.json"
         cached = read_cache(cache_path, 300)
         assert cached is not MISSING
-        assert cached["1"] == usage_result
+        assert cached["1"] == {**usage_result, "email": "test@example.com"}
 
     def test_status_preserves_other_accounts_in_cache(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
@@ -513,7 +513,7 @@ class TestStatusCache:
 
         cached = read_cache(cache_path, 300)
         assert cached is not MISSING
-        assert cached["1"] == usage_result
+        assert cached["1"] == {**usage_result, "email": "test@example.com"}
         assert cached["2"] == {"five_hour": {"pct": 80}}
 
 
