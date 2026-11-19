@@ -33,6 +33,7 @@ from claude_swap.json_output import (
     USAGE_TOKEN_EXPIRED,
     account_ref,
     account_row,
+    usage_fetched_at,
     usage_fields,
 )
 from claude_swap.credentials import (  # noqa: F401  (constants re-exported for migrations/tests)
@@ -108,16 +109,26 @@ def _usage_cache_ttl() -> float:
 def usage_entry_age(entry: object) -> float | None:
     """Seconds since ``entry`` was fetched, or ``None`` when it carries no stamp.
 
-    Only entries written by ``collect_usage_serial`` are stamped (see
-    ``USAGE_FETCHED_AT_KEY``). ``None`` means "cannot tell from the entry alone" —
-    fall back to the cache file's top-level timestamp — never "fresh".
+    Every fetch path stamps its usage dicts (``_stamp_fetch_time``, see
+    ``USAGE_FETCHED_AT_KEY``); an unstamped dict was cached by an older version.
+    ``None`` means "cannot tell from the entry alone", never "fresh".
     """
-    if not isinstance(entry, dict):
+    stamp = usage_fetched_at(entry)
+    if stamp is None:
         return None
-    stamp = entry.get(USAGE_FETCHED_AT_KEY)
-    if not isinstance(stamp, (int, float)) or isinstance(stamp, bool):
-        return None
-    return time.time() - float(stamp)
+    return time.time() - stamp
+
+
+def _stamp_fetch_time(entry: dict | str | None) -> dict | str | None:
+    """Return a usage dict stamped with the current fetch time; pass others through.
+
+    The stamp rides inside the dict so it survives the usage cache and the
+    daemon's carried-forward last-good value unchanged. Copies rather than
+    mutates, so a caller's dict is never altered.
+    """
+    if isinstance(entry, dict):
+        return {**entry, USAGE_FETCHED_AT_KEY: time.time()}
+    return entry
 
 
 # Sentinels that state a SETTLED fact about an account, so a fresh one should
@@ -1509,7 +1520,10 @@ class ClaudeAccountSwitcher:
             return [cached.get(str(info[0])) for info in accounts_info]
 
         with ThreadPoolExecutor() as executor:
-            usages = list(executor.map(self._fetch_account_usage, accounts_info))
+            usages = list(executor.map(
+                lambda info: _stamp_fetch_time(self._fetch_account_usage(info)),
+                accounts_info,
+            ))
         self._write_usage_cache(accounts_info, usages)
         return usages
 
@@ -1553,9 +1567,10 @@ class ClaudeAccountSwitcher:
         stamp. Without it a preserved reading is indistinguishable from a fresh one:
         the cache has a single top-level timestamp that every sweep rewrites, so the
         accounts that did succeed keep making a pinned value look current. Consumers
-        that must not act on an old number (the autoswap watchdog) read this stamp;
-        a missing one means the writer was the parallel path, where every entry is
-        as fresh as the file timestamp.
+        that must not act on an old number (the autoswap watchdog) and the
+        ``--list --json`` freshness fields read this stamp. The parallel
+        ``_collect_usage`` and the ``--status`` path stamp the same way, so a
+        missing one means the entry was cached by an older version.
         """
         usages: list[dict | str | None] = []
         first_call = True
@@ -1563,10 +1578,7 @@ class ClaudeAccountSwitcher:
             if not first_call and spacing_seconds > 0:
                 sleep_fn(spacing_seconds)
             first_call = False
-            usage = self._fetch_account_usage(account_info)
-            if isinstance(usage, dict):
-                usage = {**usage, USAGE_FETCHED_AT_KEY: time.time()}
-            usages.append(usage)
+            usages.append(_stamp_fetch_time(self._fetch_account_usage(account_info)))
         if preserve_last_good:
             usages = self._preserve_last_good(
                 accounts_info, usages, max_preserve_seconds
@@ -1597,9 +1609,9 @@ class ClaudeAccountSwitcher:
         forward is a bet that the next sweep will succeed; once a reading is old
         enough that the bet has clearly failed, republishing it is its own lie, so
         the account goes to ``None`` (unknown) instead. An entry with no
-        ``fetched_at`` cannot be dated, so it is kept: the parallel writer produces
-        those and they are fresh when written. The next successful fetch stamps it,
-        which is what closes that window in practice.
+        ``fetched_at`` cannot be dated, so it is kept: only a cache written by an
+        older version (before every fetch path stamped) holds those. The next
+        successful fetch stamps it, which is what closes that window in practice.
         """
         prior = read_cache(self.backup_dir / "cache" / "usage.json", float("inf"))
         if prior is MISSING or not isinstance(prior, dict):
@@ -1706,16 +1718,27 @@ class ClaudeAccountSwitcher:
         accounts_info: list[tuple[int, str, str, str, bool, str]],
         usages: list[dict | str | None],
     ) -> dict:
-        """Build the ``--list --json`` payload from gathered account + usage data."""
+        """Build the ``--list --json`` payload from gathered account + usage data.
+
+        Each row with usage carries ``usageFetchedAt``/``usageAgeSeconds`` from
+        the reading's own fetch stamp, so a cached or carried-forward reading
+        reports its real age, not the time the list was printed.
+        """
         active_num: int | None = None
         accounts = []
+        now = time.time()
         for (num, email, org_name, org_uuid, is_active, _), usage in zip(
             accounts_info, usages
         ):
             if is_active:
                 active_num = num
+            fetched_at = usage_fetched_at(usage)
             accounts.append(
-                account_row(num, email, org_name, org_uuid, is_active, usage)
+                account_row(
+                    num, email, org_name, org_uuid, is_active, usage,
+                    usage_fetched_at=fetched_at,
+                    usage_age_s=None if fetched_at is None else now - fetched_at,
+                )
             )
         return {
             "schemaVersion": SCHEMA_VERSION,
@@ -1836,7 +1859,9 @@ class ClaudeAccountSwitcher:
         if (cached is not MISSING and isinstance(cached, dict)
                 and account_num in cached):
             return cached[account_num]
-        usage = self._fetch_active_usage(account_num, current_email, creds)
+        usage = _stamp_fetch_time(
+            self._fetch_active_usage(account_num, current_email, creds)
+        )
         existing = cached if (cached is not MISSING and isinstance(cached, dict)) else {}
         existing[account_num] = self._stamp_email(usage, current_email)
         write_cache(usage_cache_path, existing)

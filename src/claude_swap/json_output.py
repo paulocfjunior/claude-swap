@@ -8,6 +8,8 @@ the single ``json.dumps`` (see cli.py).
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 # Bump only on a breaking change to any payload shape. Scripts key off this.
 SCHEMA_VERSION = 1
 
@@ -20,13 +22,15 @@ USAGE_TOKEN_EXPIRED = "token expired"
 # reported as this sentinel instead of being fetched from the OAuth usage API.
 USAGE_API_KEY = "api key"
 
-# Key stamped into a usage dict by ``collect_usage_serial`` recording when that
-# entry was actually fetched (epoch seconds). The cache file has ONE top-level
-# timestamp that every sweep rewrites, so it says when the *file* was written, not
-# how old any single account's number is — a value carried forward by
-# ``preserve_last_good`` keeps looking current forever. Consumers that must not act
-# on a stale reading check this. Deliberately NOT projected by ``usage_to_json``:
-# it is cache bookkeeping, not part of the v1 payload schema.
+# Key stamped into a usage dict recording when that entry was actually fetched
+# (epoch seconds), by every path that fetches and caches usage: the daemon's
+# ``collect_usage_serial``, the parallel ``_collect_usage`` and the ``--status``
+# active-account path. The cache file has ONE top-level timestamp that every write
+# rewrites, so it says when the *file* was written, not how old any single
+# account's number is — a value carried forward by ``preserve_last_good`` keeps
+# looking current forever. Consumers that must not act on a stale reading check
+# this. Deliberately NOT projected by ``usage_to_json``: in ``--list --json`` it
+# surfaces only as the additive ``usageFetchedAt``/``usageAgeSeconds`` row fields.
 USAGE_FETCHED_AT_KEY = "fetched_at"
 
 
@@ -95,6 +99,41 @@ def account_ref(number: int | None, email: str) -> dict:
     return {"number": number, "email": email}
 
 
+def usage_fetched_at(entry: object) -> float | None:
+    """The epoch fetch time stamped into a usage dict, or ``None`` when unknown.
+
+    ``None`` for sentinels, for entries cached before every path stamped, and for
+    a malformed stamp.
+    """
+    if not isinstance(entry, dict):
+        return None
+    value = entry.get(USAGE_FETCHED_AT_KEY)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def usage_freshness_fields(
+    fetched_at: float | None, age_s: float | None
+) -> dict:
+    """Additive ``usageFetchedAt``/``usageAgeSeconds`` fields describing how
+    old the served ``usage`` measurement is (the cache and the daemon's
+    carried-forward last-good value may serve an older reading). Emitted only
+    alongside a non-null ``usage``. Same shape as upstream claude-swap."""
+    if fetched_at is None:
+        return {}
+    fields: dict = {
+        "usageFetchedAt": (
+            datetime.fromtimestamp(fetched_at, tz=timezone.utc)
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z")
+        )
+    }
+    if age_s is not None:
+        fields["usageAgeSeconds"] = round(age_s, 1)
+    return fields
+
+
 def account_row(
     number: int,
     email: str,
@@ -102,10 +141,13 @@ def account_row(
     org_uuid: str,
     active: bool,
     usage_entry: dict | str | None,
+    *,
+    usage_fetched_at: float | None = None,
+    usage_age_s: float | None = None,
 ) -> dict:
     """A full account row for ``--list``."""
     status, usage = usage_fields(usage_entry)
-    return {
+    row = {
         "number": number,
         "email": email,
         "organizationName": org_name,
@@ -115,6 +157,9 @@ def account_row(
         "usageStatus": status,
         "usage": usage,
     }
+    if usage is not None:
+        row.update(usage_freshness_fields(usage_fetched_at, usage_age_s))
+    return row
 
 
 def error_envelope(exc: Exception) -> dict:
