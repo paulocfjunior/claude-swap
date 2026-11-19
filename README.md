@@ -167,12 +167,15 @@ cswap --switch-to 2 --json
   "accounts": [
     { "number": 2, "email": "you@example.com", "active": true, "usageStatus": "ok",
       "usage": { "fiveHour": { "pct": 25.0, "resetsAt": "2026-06-22T23:29:59Z" },
-                 "sevenDay": { "pct": 16.0, "resetsAt": "2026-06-26T17:59:59Z" } } }
+                 "sevenDay": { "pct": 16.0, "resetsAt": "2026-06-26T17:59:59Z" } },
+      "usageFetchedAt": "2026-06-22T19:02:11Z", "usageAgeSeconds": 84.6 }
   ]
 }
 ```
 
 Every payload carries a `schemaVersion` (currently `1`); on a handled error stdout is `{"schemaVersion":1,"error":{...}}` with a non-zero exit code. `--switch`/`--switch-to` report `{"switched": true|false, "from": …, "to": …, "reason": …}`.
+
+In `--list`, a row with `usage` also carries `usageFetchedAt` (when that reading was fetched, ISO 8601 UTC) and `usageAgeSeconds` (its age in seconds, one decimal). Both follow the reading through the usage cache and the daemon's carried-forward last-good value, so a reused reading reports its real age. Both are left out when the fetch time is unknown (a reading cached by an older version) and on rows without `usage`.
 
 </details>
 

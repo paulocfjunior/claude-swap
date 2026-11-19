@@ -18,6 +18,7 @@ from claude_swap.exceptions import (
     CredentialReadError,
     ValidationError,
 )
+from claude_swap.json_output import USAGE_FETCHED_AT_KEY
 from claude_swap.macos_keychain import KeychainError
 from claude_swap.models import Platform
 from claude_swap.paths import get_backup_root, get_credentials_path
@@ -485,7 +486,10 @@ class TestStatusCache:
         cache_path = switcher.backup_dir / "cache" / "usage.json"
         cached = read_cache(cache_path, 300)
         assert cached is not MISSING
-        assert cached["1"] == usage_result
+        # The cached entry is the fetched reading plus its fetch-time stamp.
+        entry = dict(cached["1"])
+        assert isinstance(entry.pop(USAGE_FETCHED_AT_KEY), float)
+        assert entry == usage_result
 
     def test_status_preserves_other_accounts_in_cache(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
@@ -513,7 +517,10 @@ class TestStatusCache:
 
         cached = read_cache(cache_path, 300)
         assert cached is not MISSING
-        assert cached["1"] == usage_result
+        # The cached entry is the fetched reading plus its fetch-time stamp.
+        entry = dict(cached["1"])
+        assert isinstance(entry.pop(USAGE_FETCHED_AT_KEY), float)
+        assert entry == usage_result
         assert cached["2"] == {"five_hour": {"pct": 80}}
 
 

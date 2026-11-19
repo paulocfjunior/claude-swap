@@ -28,10 +28,12 @@ from claude_swap.cache import MISSING, read_cache, write_cache
 from claude_swap.json_output import (
     SCHEMA_VERSION,
     USAGE_API_KEY,
+    USAGE_FETCHED_AT_KEY,
     USAGE_NO_CREDENTIALS,
     USAGE_TOKEN_EXPIRED,
     account_ref,
     account_row,
+    usage_fetched_at,
     usage_fields,
 )
 from claude_swap.credentials import (  # noqa: F401  (constants re-exported for migrations/tests)
@@ -102,6 +104,18 @@ def _usage_cache_ttl() -> float:
     except ValueError:
         return _DEFAULT_USAGE_CACHE_TTL
     return val if val >= 0 else _DEFAULT_USAGE_CACHE_TTL
+
+
+def _stamp_fetch_time(entry: dict | str | None) -> dict | str | None:
+    """Return a usage dict stamped with the current fetch time; pass others through.
+
+    The stamp rides inside the dict so it survives the usage cache and the
+    daemon's carried-forward last-good value unchanged (see json_output).
+    Copies rather than mutates, so a caller's dict is never altered.
+    """
+    if isinstance(entry, dict):
+        return {**entry, USAGE_FETCHED_AT_KEY: time.time()}
+    return entry
 
 
 def _format_usage_lines(usage: dict) -> list[str]:
@@ -1338,8 +1352,15 @@ class ClaudeAccountSwitcher:
         ``USAGE_NO_CREDENTIALS`` / ``USAGE_TOKEN_EXPIRED``), or ``None`` when the
         fetch failed. The single per-account fetch used by both the parallel
         ``_collect_usage`` path and the serial ``collect_usage_serial`` daemon path,
-        so the active-vs-session refresh nuance lives in exactly one place.
+        so the active-vs-session refresh nuance lives in exactly one place. A
+        usage dict comes back stamped with its fetch time (``_stamp_fetch_time``).
         """
+        return _stamp_fetch_time(self._fetch_account_usage_unstamped(account_info))
+
+    def _fetch_account_usage_unstamped(
+        self, account_info: tuple[int, str, str, str, bool, str]
+    ) -> dict | str | None:
+        """``_fetch_account_usage`` without the fetch-time stamp."""
         num, email, _, _, is_active, creds = account_info
         if looks_like_api_key(creds):
             # Managed API-key account: no subscription quota to fetch.
@@ -1546,16 +1567,27 @@ class ClaudeAccountSwitcher:
         accounts_info: list[tuple[int, str, str, str, bool, str]],
         usages: list[dict | str | None],
     ) -> dict:
-        """Build the ``--list --json`` payload from gathered account + usage data."""
+        """Build the ``--list --json`` payload from gathered account + usage data.
+
+        Each row with usage carries ``usageFetchedAt``/``usageAgeSeconds`` from
+        the reading's own fetch stamp, so a cached or carried-forward reading
+        reports its real age, not the time the list was printed.
+        """
         active_num: int | None = None
         accounts = []
+        now = time.time()
         for (num, email, org_name, org_uuid, is_active, _), usage in zip(
             accounts_info, usages
         ):
             if is_active:
                 active_num = num
+            fetched_at = usage_fetched_at(usage)
             accounts.append(
-                account_row(num, email, org_name, org_uuid, is_active, usage)
+                account_row(
+                    num, email, org_name, org_uuid, is_active, usage,
+                    usage_fetched_at=fetched_at,
+                    usage_age_s=None if fetched_at is None else now - fetched_at,
+                )
             )
         return {
             "schemaVersion": SCHEMA_VERSION,
@@ -1676,7 +1708,9 @@ class ClaudeAccountSwitcher:
         if (cached is not MISSING and isinstance(cached, dict)
                 and account_num in cached):
             return cached[account_num]
-        usage = self._fetch_active_usage(account_num, current_email, creds)
+        usage = _stamp_fetch_time(
+            self._fetch_active_usage(account_num, current_email, creds)
+        )
         existing = cached if (cached is not MISSING and isinstance(cached, dict)) else {}
         existing[account_num] = usage
         write_cache(usage_cache_path, existing)
